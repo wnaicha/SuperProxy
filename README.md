@@ -1,8 +1,8 @@
-# SuperProxy v0.3.0
+# SuperProxy v0.3.1
 
 OpenWrt/iStoreOS fixed-IP proxy controller for sing-box.
 
-## v0.3.0
+## v0.3.1
 - Dashboard default port moved to 9088 to avoid common Mihomo 9090 conflict.
 - Dedicated `superproxy-singbox` procd service; Apply now validates config, applies firewall, starts sing-box, and verifies it is running.
 - Dashboard shows installed/running state, architecture, node count and bound-IP count.
@@ -26,3 +26,10 @@ The installer preserves `/etc/superproxy/config.json`. If the token is still `CH
 - `openwrt/superproxy-firewall` fail-closed guard
 - `scripts/install-panel.sh` remote installer/upgrader
 - `dist/` static amd64/arm64 backend binaries
+
+
+## v0.3.1
+- 修复 Dashboard 登录按钮事件与登录反馈。
+- 禁用 Dashboard 静态页面缓存，升级后立即加载新 UI。
+- 新增分享链接批量导入：SOCKS5、HTTP/HTTPS、VLESS、Trojan、Shadowsocks。
+- 节点导入后可直接使用节点测试功能验证出口 IPv4 与耗时。

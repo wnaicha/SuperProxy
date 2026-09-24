@@ -3,12 +3,14 @@ package main
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,7 +67,11 @@ func main() {
 	mux.HandleFunc("/api/core", a.auth(a.core))
 	mux.HandleFunc("/api/core/install", a.auth(a.coreInstall))
 	mux.HandleFunc("/api/node/test/", a.auth(a.nodeTest))
-	mux.Handle("/", http.FileServer(http.Dir(env("SUPERPROXY_WEB", "/usr/share/superproxy/web"))))
+	mux.HandleFunc("/api/node/import", a.auth(a.nodeImport))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		http.FileServer(http.Dir(env("SUPERPROXY_WEB", "/usr/share/superproxy/web"))).ServeHTTP(w, r)
+	}))
 	log.Printf("SuperProxy listening on %s", a.cfg.Listen)
 	log.Fatal(http.ListenAndServe(a.cfg.Listen, mux))
 }
@@ -354,4 +360,151 @@ func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOut(w, map[string]any{"ok": true, "tcp_ms": tcpms, "latency_ms": ms, "exit_ip": strings.TrimSpace(string(out))})
+}
+
+func decodeB64(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding} {
+		if b, e := enc.DecodeString(s); e == nil {
+			return string(b), nil
+		}
+	}
+	return "", fmt.Errorf("invalid base64")
+}
+func nodeID() string { return fmt.Sprintf("n%x", time.Now().UnixNano()) }
+func parseNodeLink(raw string) (Node, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return Node{}, fmt.Errorf("empty link")
+	}
+	if strings.HasPrefix(raw, "ss://") {
+		body := strings.TrimPrefix(raw, "ss://")
+		name := "Shadowsocks"
+		if i := strings.Index(body, "#"); i >= 0 {
+			if x, e := url.QueryUnescape(body[i+1:]); e == nil && x != "" {
+				name = x
+			}
+			body = body[:i]
+		}
+		var method, pass, hostport string
+		if at := strings.LastIndex(body, "@"); at >= 0 {
+			cred := body[:at]
+			hostport = body[at+1:]
+			if d, e := decodeB64(cred); e == nil {
+				cred = d
+			}
+			parts := strings.SplitN(cred, ":", 2)
+			if len(parts) != 2 {
+				return Node{}, fmt.Errorf("invalid ss credentials")
+			}
+			method, pass = parts[0], parts[1]
+		} else {
+			d, e := decodeB64(body)
+			if e != nil {
+				return Node{}, e
+			}
+			at := strings.LastIndex(d, "@")
+			if at < 0 {
+				return Node{}, fmt.Errorf("invalid ss link")
+			}
+			cred, hp := d[:at], d[at+1:]
+			parts := strings.SplitN(cred, ":", 2)
+			if len(parts) != 2 {
+				return Node{}, fmt.Errorf("invalid ss credentials")
+			}
+			method, pass, hostport = parts[0], parts[1], hp
+		}
+		host, ps, e := net.SplitHostPort(hostport)
+		if e != nil {
+			return Node{}, e
+		}
+		port, e := strconv.Atoi(ps)
+		if e != nil {
+			return Node{}, e
+		}
+		return Node{ID: nodeID(), Name: name, Type: "shadowsocks", Server: host, Port: port, Method: method, Password: pass}, nil
+	}
+	u, e := url.Parse(raw)
+	if e != nil {
+		return Node{}, e
+	}
+	name, _ := url.QueryUnescape(u.Fragment)
+	if name == "" {
+		name = u.Hostname()
+	}
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		if u.Scheme == "https" {
+			port = 443
+		} else {
+			port = 80
+		}
+	}
+	n := Node{ID: nodeID(), Name: name, Server: u.Hostname(), Port: port}
+	q := u.Query()
+	switch strings.ToLower(u.Scheme) {
+	case "socks", "socks5", "socks5h":
+		n.Type = "socks"
+		if u.User != nil {
+			n.Username = u.User.Username()
+			n.Password, _ = u.User.Password()
+		}
+	case "http", "https":
+		n.Type = "http"
+		n.TLS = u.Scheme == "https"
+		if u.User != nil {
+			n.Username = u.User.Username()
+			n.Password, _ = u.User.Password()
+		}
+		n.ServerName = q.Get("sni")
+	case "trojan":
+		n.Type = "trojan"
+		if u.User != nil {
+			n.Password = u.User.Username()
+		}
+		n.TLS = true
+		n.ServerName = q.Get("sni")
+		if n.ServerName == "" {
+			n.ServerName = q.Get("peer")
+		}
+	case "vless":
+		n.Type = "vless"
+		if u.User != nil {
+			n.UUID = u.User.Username()
+		}
+		sec := q.Get("security")
+		n.TLS = sec == "tls" || sec == "reality"
+		n.ServerName = q.Get("sni")
+	default:
+		return Node{}, fmt.Errorf("unsupported scheme: %s", u.Scheme)
+	}
+	if n.Server == "" || n.Port < 1 {
+		return Node{}, fmt.Errorf("missing server/port")
+	}
+	return n, nil
+}
+func (a *App) nodeImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method", 405)
+		return
+	}
+	var req struct {
+		Links string `json:"links"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		http.Error(w, "bad json", 400)
+		return
+	}
+	lines := strings.Fields(req.Links)
+	added := []Node{}
+	errs := []string{}
+	for _, line := range lines {
+		n, e := parseNodeLink(line)
+		if e != nil {
+			errs = append(errs, e.Error())
+			continue
+		}
+		added = append(added, n)
+	}
+	jsonOut(w, map[string]any{"ok": len(added) > 0, "nodes": added, "errors": errs})
 }
