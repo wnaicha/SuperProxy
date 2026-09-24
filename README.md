@@ -33,3 +33,9 @@ The installer preserves `/etc/superproxy/config.json`. If the token is still `CH
 - 禁用 Dashboard 静态页面缓存，升级后立即加载新 UI。
 - 新增分享链接批量导入：SOCKS5、HTTP/HTTPS、VLESS、Trojan、Shadowsocks。
 - 节点导入后可直接使用节点测试功能验证出口 IPv4 与耗时。
+
+## v0.4.0
+- Complete VLESS REALITY/Vision share-link parsing for sing-box: security, flow, SNI, uTLS fingerprint, REALITY public key and short ID.
+- Node tests now run `sing-box check` on the exact temporary outbound before starting it.
+- Test failures return a stage (`tcp`, `config`, `start`, `proxy`) and include sing-box diagnostics.
+- Dashboard exposes REALITY fields for manual VLESS nodes and identifies REALITY/Vision nodes in the list.

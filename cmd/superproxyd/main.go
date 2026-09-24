@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -21,17 +22,23 @@ import (
 )
 
 type Node struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Server     string `json:"server"`
-	Port       int    `json:"port"`
-	UUID       string `json:"uuid,omitempty"`
-	Username   string `json:"username,omitempty"`
-	Password   string `json:"password,omitempty"`
-	Method     string `json:"method,omitempty"`
-	TLS        bool   `json:"tls,omitempty"`
-	ServerName string `json:"server_name,omitempty"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Type             string `json:"type"`
+	Server           string `json:"server"`
+	Port             int    `json:"port"`
+	UUID             string `json:"uuid,omitempty"`
+	Username         string `json:"username,omitempty"`
+	Password         string `json:"password,omitempty"`
+	Method           string `json:"method,omitempty"`
+	TLS              bool   `json:"tls,omitempty"`
+	ServerName       string `json:"server_name,omitempty"`
+	Security         string `json:"security,omitempty"`
+	Flow             string `json:"flow,omitempty"`
+	Fingerprint      string `json:"fingerprint,omitempty"`
+	RealityPublicKey string `json:"reality_public_key,omitempty"`
+	RealityShortID   string `json:"reality_short_id,omitempty"`
+	Transport        string `json:"transport,omitempty"`
 }
 type Binding struct {
 	NodeID string   `json:"node_id"`
@@ -220,8 +227,24 @@ func nodeOutbound(n Node) map[string]any {
 	if n.Method != "" {
 		m["method"] = n.Method
 	}
-	if n.TLS {
-		m["tls"] = map[string]any{"enabled": true, "server_name": n.ServerName}
+	if n.Flow != "" {
+		m["flow"] = n.Flow
+	}
+	if n.Type == "vless" && n.Transport != "" && n.Transport != "tcp" {
+		m["transport"] = map[string]any{"type": n.Transport}
+	}
+	if n.TLS || n.Security == "reality" || n.Security == "tls" {
+		tls := map[string]any{"enabled": true}
+		if n.ServerName != "" {
+			tls["server_name"] = n.ServerName
+		}
+		if n.Fingerprint != "" {
+			tls["utls"] = map[string]any{"enabled": true, "fingerprint": n.Fingerprint}
+		}
+		if n.Security == "reality" {
+			tls["reality"] = map[string]any{"enabled": true, "public_key": n.RealityPublicKey, "short_id": n.RealityShortID}
+		}
+		m["tls"] = tls
 	}
 	return m
 }
@@ -335,13 +358,19 @@ func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	testcfg := map[string]any{"log": map[string]any{"level": "error"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "test-in", "listen": "127.0.0.1", "listen_port": port}}, "outbounds": []any{nodeOutbound(*n)}, "route": map[string]any{"default_domain_resolver": "local"}, "dns": map[string]any{"servers": []any{map[string]any{"type": "local", "tag": "local"}}}}
-	b, _ := json.Marshal(testcfg)
+	b, _ := json.MarshalIndent(testcfg, "", "  ")
 	tmp := fmt.Sprintf("/tmp/superproxy-node-test-%d.json", time.Now().UnixNano())
 	os.WriteFile(tmp, b, 0600)
 	defer os.Remove(tmp)
+	if out, ce := exec.Command("sing-box", "check", "-c", tmp).CombinedOutput(); ce != nil {
+		jsonOut(w, map[string]any{"ok": false, "stage": "config", "tcp_ms": tcpms, "error": strings.TrimSpace(string(out))})
+		return
+	}
+	var corelog bytes.Buffer
 	cmd := exec.Command("sing-box", "run", "-c", tmp)
+	cmd.Stdout, cmd.Stderr = &corelog, &corelog
 	if e = cmd.Start(); e != nil {
-		jsonOut(w, map[string]any{"ok": false, "stage": "start", "error": e.Error()})
+		jsonOut(w, map[string]any{"ok": false, "stage": "start", "tcp_ms": tcpms, "error": e.Error()})
 		return
 	}
 	defer func() {
@@ -350,13 +379,21 @@ func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
 			cmd.Wait()
 		}
 	}()
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		jsonOut(w, map[string]any{"ok": false, "stage": "start", "tcp_ms": tcpms, "error": strings.TrimSpace(corelog.String())})
+		return
+	}
 	proxy := fmt.Sprintf("socks5h://127.0.0.1:%d", port)
 	t := time.Now()
 	out, e := exec.Command("curl", "-4", "-fsS", "--max-time", "10", "--proxy", proxy, "https://api.ipify.org").CombinedOutput()
 	ms := time.Since(t).Milliseconds()
 	if e != nil {
-		jsonOut(w, map[string]any{"ok": false, "stage": "proxy", "tcp_ms": tcpms, "latency_ms": ms, "error": strings.TrimSpace(string(out))})
+		errText := strings.TrimSpace(string(out))
+		if strings.TrimSpace(corelog.String()) != "" {
+			errText += " | sing-box: " + strings.TrimSpace(corelog.String())
+		}
+		jsonOut(w, map[string]any{"ok": false, "stage": "proxy", "tcp_ms": tcpms, "latency_ms": ms, "error": errText})
 		return
 	}
 	jsonOut(w, map[string]any{"ok": true, "tcp_ms": tcpms, "latency_ms": ms, "exit_ip": strings.TrimSpace(string(out))})
@@ -472,9 +509,22 @@ func parseNodeLink(raw string) (Node, error) {
 		if u.User != nil {
 			n.UUID = u.User.Username()
 		}
-		sec := q.Get("security")
-		n.TLS = sec == "tls" || sec == "reality"
+		n.Security = strings.ToLower(q.Get("security"))
+		n.TLS = n.Security == "tls" || n.Security == "reality"
 		n.ServerName = q.Get("sni")
+		n.Flow = q.Get("flow")
+		n.Fingerprint = q.Get("fp")
+		n.RealityPublicKey = q.Get("pbk")
+		n.RealityShortID = q.Get("sid")
+		n.Transport = strings.ToLower(q.Get("type"))
+		if n.Transport == "" {
+			n.Transport = "tcp"
+		}
+		if n.Security == "reality" {
+			if n.ServerName == "" || n.RealityPublicKey == "" {
+				return Node{}, fmt.Errorf("VLESS REALITY missing sni or pbk")
+			}
+		}
 	default:
 		return Node{}, fmt.Errorf("unsupported scheme: %s", u.Scheme)
 	}
