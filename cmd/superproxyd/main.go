@@ -21,37 +21,49 @@ import (
 	"time"
 )
 
+type NodeTestResult struct {
+	OK        bool   `json:"ok"`
+	Stage     string `json:"stage,omitempty"`
+	TCPMs     int64  `json:"tcp_ms,omitempty"`
+	LatencyMs int64  `json:"latency_ms,omitempty"`
+	ExitIP    string `json:"exit_ip,omitempty"`
+	Error     string `json:"error,omitempty"`
+	TestedAt  string `json:"tested_at,omitempty"`
+}
+
 type Node struct {
-	ID               string `json:"id"`
-	Name             string `json:"name"`
-	Type             string `json:"type"`
-	Server           string `json:"server"`
-	Port             int    `json:"port"`
-	UUID             string `json:"uuid,omitempty"`
-	Username         string `json:"username,omitempty"`
-	Password         string `json:"password,omitempty"`
-	Method           string `json:"method,omitempty"`
-	TLS              bool   `json:"tls,omitempty"`
-	ServerName       string `json:"server_name,omitempty"`
-	Security         string `json:"security,omitempty"`
-	Flow             string `json:"flow,omitempty"`
-	Fingerprint      string `json:"fingerprint,omitempty"`
-	RealityPublicKey string `json:"reality_public_key,omitempty"`
-	RealityShortID   string `json:"reality_short_id,omitempty"`
-	Transport        string `json:"transport,omitempty"`
+	ID               string          `json:"id"`
+	Name             string          `json:"name"`
+	Type             string          `json:"type"`
+	Server           string          `json:"server"`
+	Port             int             `json:"port"`
+	UUID             string          `json:"uuid,omitempty"`
+	Username         string          `json:"username,omitempty"`
+	Password         string          `json:"password,omitempty"`
+	Method           string          `json:"method,omitempty"`
+	TLS              bool            `json:"tls,omitempty"`
+	ServerName       string          `json:"server_name,omitempty"`
+	Security         string          `json:"security,omitempty"`
+	Flow             string          `json:"flow,omitempty"`
+	Fingerprint      string          `json:"fingerprint,omitempty"`
+	RealityPublicKey string          `json:"reality_public_key,omitempty"`
+	RealityShortID   string          `json:"reality_short_id,omitempty"`
+	Transport        string          `json:"transport,omitempty"`
+	LastTest         *NodeTestResult `json:"last_test,omitempty"`
 }
 type Binding struct {
 	NodeID string   `json:"node_id"`
 	IPs    []string `json:"ips"`
 }
 type Config struct {
-	Listen       string    `json:"listen"`
-	Token        string    `json:"token"`
-	LANInterface string    `json:"lan_interface"`
-	WANInterface string    `json:"wan_interface"`
-	TunName      string    `json:"tun_name"`
-	Nodes        []Node    `json:"nodes"`
-	Bindings     []Binding `json:"bindings"`
+	Listen                  string    `json:"listen"`
+	Token                   string    `json:"token"`
+	LANInterface            string    `json:"lan_interface"`
+	WANInterface            string    `json:"wan_interface"`
+	TunName                 string    `json:"tun_name"`
+	Nodes                   []Node    `json:"nodes"`
+	Bindings                []Binding `json:"bindings"`
+	AutoTestIntervalMinutes int       `json:"auto_test_interval_minutes,omitempty"`
 }
 type App struct {
 	mu   sync.Mutex
@@ -74,11 +86,13 @@ func main() {
 	mux.HandleFunc("/api/core", a.auth(a.core))
 	mux.HandleFunc("/api/core/install", a.auth(a.coreInstall))
 	mux.HandleFunc("/api/node/test/", a.auth(a.nodeTest))
+	mux.HandleFunc("/api/node/test-all", a.auth(a.nodeTestAll))
 	mux.HandleFunc("/api/node/import", a.auth(a.nodeImport))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		http.FileServer(http.Dir(env("SUPERPROXY_WEB", "/usr/share/superproxy/web"))).ServeHTTP(w, r)
 	}))
+	go a.autoTestLoop()
 	log.Printf("SuperProxy listening on %s", a.cfg.Listen)
 	log.Fatal(http.ListenAndServe(a.cfg.Listen, mux))
 }
@@ -105,6 +119,9 @@ func (a *App) load() error {
 	}
 	if a.cfg.Listen == "" || a.cfg.Listen == "0.0.0.0:9090" {
 		a.cfg.Listen = "0.0.0.0:9088"
+	}
+	if a.cfg.AutoTestIntervalMinutes <= 0 {
+		a.cfg.AutoTestIntervalMinutes = 30
 	}
 	if a.cfg.Token == "" || a.cfg.Token == "CHANGE-ME-NOW" {
 		a.cfg.Token = randomToken()
@@ -329,49 +346,42 @@ func (a *App) logs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(out)
 }
-func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
-	id := filepath.Base(r.URL.Path)
-	var n *Node
-	for i := range a.cfg.Nodes {
-		if a.cfg.Nodes[i].ID == id {
-			n = &a.cfg.Nodes[i]
-			break
-		}
-	}
-	if n == nil {
-		http.Error(w, "node not found", 404)
-		return
-	}
+func testNodeCore(n Node) NodeTestResult {
+	res := NodeTestResult{TestedAt: time.Now().Format(time.RFC3339)}
 	start := time.Now()
 	conn, e := net.DialTimeout("tcp", net.JoinHostPort(n.Server, strconv.Itoa(n.Port)), 5*time.Second)
 	if e != nil {
-		jsonOut(w, map[string]any{"ok": false, "stage": "tcp", "error": e.Error()})
-		return
+		res.Stage = "tcp"
+		res.Error = e.Error()
+		return res
 	}
 	conn.Close()
-	tcpms := time.Since(start).Milliseconds()
+	res.TCPMs = time.Since(start).Milliseconds()
 	ln, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
-		http.Error(w, e.Error(), 500)
-		return
+		res.Stage = "listen"
+		res.Error = e.Error()
+		return res
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
-	testcfg := map[string]any{"log": map[string]any{"level": "error"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "test-in", "listen": "127.0.0.1", "listen_port": port}}, "outbounds": []any{nodeOutbound(*n)}, "route": map[string]any{"default_domain_resolver": "local"}, "dns": map[string]any{"servers": []any{map[string]any{"type": "local", "tag": "local"}}}}
+	testcfg := map[string]any{"log": map[string]any{"level": "error"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "test-in", "listen": "127.0.0.1", "listen_port": port}}, "outbounds": []any{nodeOutbound(n)}, "route": map[string]any{"default_domain_resolver": "local"}, "dns": map[string]any{"servers": []any{map[string]any{"type": "local", "tag": "local"}}}}
 	b, _ := json.MarshalIndent(testcfg, "", "  ")
 	tmp := fmt.Sprintf("/tmp/superproxy-node-test-%d.json", time.Now().UnixNano())
 	os.WriteFile(tmp, b, 0600)
 	defer os.Remove(tmp)
 	if out, ce := exec.Command("sing-box", "check", "-c", tmp).CombinedOutput(); ce != nil {
-		jsonOut(w, map[string]any{"ok": false, "stage": "config", "tcp_ms": tcpms, "error": strings.TrimSpace(string(out))})
-		return
+		res.Stage = "config"
+		res.Error = strings.TrimSpace(string(out))
+		return res
 	}
 	var corelog bytes.Buffer
 	cmd := exec.Command("sing-box", "run", "-c", tmp)
 	cmd.Stdout, cmd.Stderr = &corelog, &corelog
 	if e = cmd.Start(); e != nil {
-		jsonOut(w, map[string]any{"ok": false, "stage": "start", "tcp_ms": tcpms, "error": e.Error()})
-		return
+		res.Stage = "start"
+		res.Error = e.Error()
+		return res
 	}
 	defer func() {
 		if cmd.Process != nil {
@@ -380,23 +390,83 @@ func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	time.Sleep(500 * time.Millisecond)
-	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-		jsonOut(w, map[string]any{"ok": false, "stage": "start", "tcp_ms": tcpms, "error": strings.TrimSpace(corelog.String())})
-		return
-	}
 	proxy := fmt.Sprintf("socks5h://127.0.0.1:%d", port)
 	t := time.Now()
 	out, e := exec.Command("curl", "-4", "-fsS", "--max-time", "10", "--proxy", proxy, "https://api.ipify.org").CombinedOutput()
-	ms := time.Since(t).Milliseconds()
+	res.LatencyMs = time.Since(t).Milliseconds()
 	if e != nil {
-		errText := strings.TrimSpace(string(out))
+		res.Stage = "proxy"
+		res.Error = strings.TrimSpace(string(out))
 		if strings.TrimSpace(corelog.String()) != "" {
-			errText += " | sing-box: " + strings.TrimSpace(corelog.String())
+			res.Error += " | sing-box: " + strings.TrimSpace(corelog.String())
 		}
-		jsonOut(w, map[string]any{"ok": false, "stage": "proxy", "tcp_ms": tcpms, "latency_ms": ms, "error": errText})
+		return res
+	}
+	res.OK = true
+	res.Stage = "ok"
+	res.ExitIP = strings.TrimSpace(string(out))
+	return res
+}
+func (a *App) storeTest(id string, res NodeTestResult) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.cfg.Nodes {
+		if a.cfg.Nodes[i].ID == id {
+			a.cfg.Nodes[i].LastTest = &res
+			_ = a.save()
+			return
+		}
+	}
+}
+func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
+	id := filepath.Base(r.URL.Path)
+	a.mu.Lock()
+	var n *Node
+	for i := range a.cfg.Nodes {
+		if a.cfg.Nodes[i].ID == id {
+			c := a.cfg.Nodes[i]
+			n = &c
+			break
+		}
+	}
+	a.mu.Unlock()
+	if n == nil {
+		http.Error(w, "node not found", 404)
 		return
 	}
-	jsonOut(w, map[string]any{"ok": true, "tcp_ms": tcpms, "latency_ms": ms, "exit_ip": strings.TrimSpace(string(out))})
+	res := testNodeCore(*n)
+	a.storeTest(id, res)
+	jsonOut(w, res)
+}
+func (a *App) nodeTestAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method", 405)
+		return
+	}
+	go a.runAllTests()
+	jsonOut(w, map[string]any{"ok": true, "started": true})
+}
+func (a *App) runAllTests() {
+	a.mu.Lock()
+	nodes := append([]Node(nil), a.cfg.Nodes...)
+	a.mu.Unlock()
+	for _, n := range nodes {
+		res := testNodeCore(n)
+		a.storeTest(n.ID, res)
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+func (a *App) autoTestLoop() {
+	for {
+		a.mu.Lock()
+		mins := a.cfg.AutoTestIntervalMinutes
+		a.mu.Unlock()
+		if mins < 5 {
+			mins = 5
+		}
+		time.Sleep(time.Duration(mins) * time.Minute)
+		a.runAllTests()
+	}
 }
 
 func decodeB64(s string) (string, error) {

@@ -48,3 +48,10 @@ The installer preserves `/etc/superproxy/config.json`. If the token is still `CH
 - Installer prints progress and download errors instead of failing silently.
 - Keeps existing `/etc/superproxy/config.json` and migrates dashboard port 9090 to 9088.
 - Retains v0.4 VLESS REALITY/Vision import and sing-box-backed node testing.
+
+## v0.5.0
+- 自动节点测速，默认每 30 分钟后台逐个测试；可选 5/15/30/60/180/360 分钟。
+- 每个节点持久保存最后测速时间、完整代理耗时、TCP 耗时、出口 IPv4 与失败阶段；刷新/重新打开面板仍显示。
+- 节点列表直接“绑定”弹窗，无需滚动到页面底部；同一 IP 保存时自动从其他节点解绑。
+- 节点实时搜索：节点名、服务器 IP、绑定 IP、协议、安全类型和 Flow。
+- 节点列表与绑定总览 UI 优化，增加“全部测速”。

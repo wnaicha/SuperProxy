@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-VERSION="0.4.1"
+VERSION="0.5.0"
 OWNER="${SUPERPROXY_OWNER:-wnaicha}"; REPO="${SUPERPROXY_REPO:-SuperProxy}"; BRANCH="${SUPERPROXY_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${OWNER}/${REPO}/refs/heads/${BRANCH}"
 [ "$(id -u)" = 0 ] || { echo 'ERROR: run as root'; exit 1; }
