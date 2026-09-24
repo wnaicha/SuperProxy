@@ -1,4 +1,4 @@
-# SuperProxy v0.4.1
+# SuperProxy v0.5.2
 
 # SuperProxy v0.3.1
 
@@ -55,3 +55,11 @@ The installer preserves `/etc/superproxy/config.json`. If the token is still `CH
 - 节点列表直接“绑定”弹窗，无需滚动到页面底部；同一 IP 保存时自动从其他节点解绑。
 - 节点实时搜索：节点名、服务器 IP、绑定 IP、协议、安全类型和 Flow。
 - 节点列表与绑定总览 UI 优化，增加“全部测速”。
+
+## v0.5.2
+- 安装器下载过程显示百分比、实时速度与 ETA；每个文件下载后显示实际大小。
+- 后端二进制优先 GitHub Release，失败自动回退 GitHub Raw。
+- 支持 `SUPERPROXY_MIRROR` 自定义 GitHub Release 加速前缀，镜像失败自动回退官方源。
+- 新增 `dist/SHA256SUMS`，下载后校验 AMD64/ARM64 后端完整性。
+- 已安装后端 SHA256 与当前版本一致时自动跳过约 5 MB 二进制下载，UI/脚本升级更快。
+- 修正安装器版本号为 v0.5.2；继续保留现有 `/etc/superproxy/config.json`、节点与绑定。
