@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+CFG=/etc/superproxy/config.json
+MODE=${1:-apply}
+[ "$MODE" = apply ] || exit 2
+command -v nft >/dev/null
+# Fail-closed guard: only configured phone IPv4 addresses are placed in this set.
+IPS=$(jsonfilter -i "$CFG" -e '@.bindings[*].ips[*]' 2>/dev/null || true)
+nft delete table inet superproxy_guard 2>/dev/null || true
+nft add table inet superproxy_guard
+nft 'add set inet superproxy_guard phones4 { type ipv4_addr; flags interval; }'
+for ip in $IPS; do nft add element inet superproxy_guard phones4 "{ $ip }"; done
+# TUN routing is handled by sing-box. Guard against accidental direct forwarding to WAN.
+# fw4 hook uses forward priority 10, after normal routing decision.
+nft 'add chain inet superproxy_guard forward { type filter hook forward priority 10; policy accept; }'
+nft add rule inet superproxy_guard forward ip saddr @phones4 oifname "$(jsonfilter -i "$CFG" -e '@.wan_interface')" counter drop
+# IPv6 is globally disabled by install.sh; this table is an additional forward guard.
+nft 'add rule inet superproxy_guard forward meta nfproto ipv6 counter drop'

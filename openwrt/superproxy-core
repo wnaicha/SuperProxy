@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+ install)
+   if command -v curl >/dev/null 2>&1; then curl -fsSL https://sing-box.app/install.sh | sh
+   elif command -v wget >/dev/null 2>&1; then wget -qO- https://sing-box.app/install.sh | sh
+   else opkg update; opkg install curl ca-bundle; curl -fsSL https://sing-box.app/install.sh | sh; fi
+   command -v sing-box >/dev/null
+   sing-box version
+   [ -x /etc/init.d/sing-box ] && /etc/init.d/sing-box enable || true
+   ;;
+ *) echo 'usage: superproxy-core install'; exit 2;;
+esac

@@ -1,0 +1,9 @@
+{
+  "listen": "0.0.0.0:9090",
+  "token": "CHANGE-ME-NOW",
+  "lan_interface": "br-lan",
+  "wan_interface": "wan",
+  "tun_name": "superproxy0",
+  "nodes": [],
+  "bindings": []
+}
