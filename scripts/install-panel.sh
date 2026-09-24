@@ -1,82 +1,24 @@
 #!/bin/sh
 set -eu
-OWNER="${SUPERPROXY_OWNER:-wnaicha}"
-REPO="${SUPERPROXY_REPO:-SuperProxy}"
-BRANCH="${SUPERPROXY_BRANCH:-main}"
+OWNER="${SUPERPROXY_OWNER:-wnaicha}"; REPO="${SUPERPROXY_REPO:-SuperProxy}"; BRANCH="${SUPERPROXY_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${OWNER}/${REPO}/refs/heads/${BRANCH}"
-
-[ "$(id -u)" = "0" ] || { echo "ERROR: run as root"; exit 1; }
-
-case "$(uname -m)" in
-  aarch64|arm64) BIN="superproxyd-linux-arm64" ;;
-  x86_64|amd64) BIN="superproxyd-linux-amd64" ;;
-  *) echo "ERROR: unsupported architecture: $(uname -m)"; exit 1 ;;
-esac
-
-fetch() {
-  echo "Downloading $1"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$1" -o "$2"
-  else
-    wget -qO "$2" "$1"
-  fi
-}
-
-mkdir -p /etc/superproxy /usr/share/superproxy/web /usr/libexec /usr/bin
-TMP="/tmp/superproxy-install.$$"
-mkdir -p "$TMP"
-trap 'rm -rf "$TMP"' EXIT INT TERM
-
-fetch "$RAW/etc/config.example.json" "$TMP/config.json"
-fetch "$RAW/web/index.html" "$TMP/index.html"
-fetch "$RAW/openwrt/superproxy.init" "$TMP/init"
-fetch "$RAW/openwrt/superproxy-firewall" "$TMP/firewall"
-fetch "$RAW/openwrt/superproxy-core" "$TMP/core"
-fetch "$RAW/dist/$BIN" "$TMP/superproxyd"
-
-for f in config.json index.html init firewall core superproxyd; do
-  [ -s "$TMP/$f" ] || { echo "ERROR: failed to download $f"; exit 1; }
-done
-
-[ -f /etc/superproxy/config.json ] || cp "$TMP/config.json" /etc/superproxy/config.json
-cp "$TMP/index.html" /usr/share/superproxy/web/index.html
-cp "$TMP/init" /etc/init.d/superproxy
-cp "$TMP/firewall" /usr/libexec/superproxy-firewall
-cp "$TMP/core" /usr/libexec/superproxy-core
-cp "$TMP/superproxyd" /usr/bin/superproxyd
-chmod +x /etc/init.d/superproxy /usr/libexec/superproxy-* /usr/bin/superproxyd
-
-if ! command -v nft >/dev/null 2>&1; then
-  opkg update
-  opkg install nftables-json
-fi
-
-# Dedicated SuperProxy phone LAN: IPv6 disabled.
-uci -q set network.lan.ip6assign='0' || true
-uci -q delete network.lan.ip6hint || true
-uci -q set dhcp.lan.dhcpv6='disabled' || true
-uci -q set dhcp.lan.ra='disabled' || true
-uci -q set dhcp.lan.ndp='disabled' || true
-uci commit network || true
-uci commit dhcp || true
-
-mkdir -p /etc/sysctl.d
-cat >/etc/sysctl.d/99-superproxy-ipv6.conf <<'EOF'
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-EOF
-sysctl -p /etc/sysctl.d/99-superproxy-ipv6.conf >/dev/null 2>&1 || true
-
-/etc/init.d/superproxy enable
-/etc/init.d/superproxy restart
-
-echo "========================================"
-echo " SuperProxy panel installed"
-echo " Architecture: $(uname -m)"
-echo " Dashboard: http://ROUTER_IP:9090"
-if command -v sing-box >/dev/null 2>&1; then
-  echo " sing-box: installed"
-else
-  echo " sing-box: NOT installed (install it from Dashboard or install-core.sh)"
-fi
-echo "========================================"
+[ "$(id -u)" = 0 ] || { echo 'ERROR: run as root'; exit 1; }
+case "$(uname -m)" in aarch64|arm64) BIN=superproxyd-linux-arm64;; x86_64|amd64) BIN=superproxyd-linux-amd64;; *) echo "ERROR: unsupported architecture: $(uname -m)"; exit 1;; esac
+fetch(){ echo "Downloading $1"; if command -v curl >/dev/null 2>&1;then curl -fsSL "$1" -o "$2";else wget -qO "$2" "$1";fi; }
+for c in nft jsonfilter curl; do command -v "$c" >/dev/null 2>&1 || { opkg update; opkg install nftables-json jsonfilter ca-bundle curl; break; }; done
+mkdir -p /etc/superproxy /usr/share/superproxy/web /usr/libexec /usr/bin /etc/sing-box
+TMP="/tmp/superproxy-install.$$"; mkdir -p "$TMP"; trap 'rm -rf "$TMP"' EXIT INT TERM
+fetch "$RAW/etc/config.example.json" "$TMP/config.json"; fetch "$RAW/web/index.html" "$TMP/index.html"; fetch "$RAW/openwrt/superproxy.init" "$TMP/superproxy.init"; fetch "$RAW/openwrt/superproxy-singbox.init" "$TMP/superproxy-singbox.init"; fetch "$RAW/openwrt/superproxy-firewall" "$TMP/firewall"; fetch "$RAW/openwrt/superproxy-core" "$TMP/core"; fetch "$RAW/dist/$BIN" "$TMP/superproxyd"
+for f in config.json index.html superproxy.init superproxy-singbox.init firewall core superproxyd;do [ -s "$TMP/$f" ]||{ echo "ERROR: download failed: $f";exit 1;};done
+NEW_TOKEN=""
+if [ ! -f /etc/superproxy/config.json ];then cp "$TMP/config.json" /etc/superproxy/config.json;fi
+# v0.3 migration: avoid Mihomo 9090 and replace the insecure placeholder token.
+sed -i 's/0\.0\.0\.0:9090/0.0.0.0:9088/g' /etc/superproxy/config.json
+if grep -q '"token"[[:space:]]*:[[:space:]]*"CHANGE-ME-NOW"' /etc/superproxy/config.json;then NEW_TOKEN="$(dd if=/dev/urandom bs=24 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)"; [ -n "$NEW_TOKEN" ]||NEW_TOKEN="sp$(date +%s)$(awk 'BEGIN{srand();print int(rand()*1000000)}')"; sed -i "s/\"token\"[[:space:]]*:[[:space:]]*\"CHANGE-ME-NOW\"/\"token\": \"$NEW_TOKEN\"/" /etc/superproxy/config.json;fi
+cp "$TMP/index.html" /usr/share/superproxy/web/index.html; cp "$TMP/superproxy.init" /etc/init.d/superproxy; cp "$TMP/superproxy-singbox.init" /etc/init.d/superproxy-singbox; cp "$TMP/firewall" /usr/libexec/superproxy-firewall; cp "$TMP/core" /usr/libexec/superproxy-core; cp "$TMP/superproxyd" /usr/bin/superproxyd
+chmod +x /etc/init.d/superproxy /etc/init.d/superproxy-singbox /usr/libexec/superproxy-* /usr/bin/superproxyd
+uci -q set network.lan.ip6assign='0'||true; uci -q delete network.lan.ip6hint||true; uci -q set dhcp.lan.dhcpv6='disabled'||true; uci -q set dhcp.lan.ra='disabled'||true; uci -q set dhcp.lan.ndp='disabled'||true; uci commit network||true; uci commit dhcp||true
+mkdir -p /etc/sysctl.d; printf '%s\n' 'net.ipv6.conf.all.disable_ipv6=1' 'net.ipv6.conf.default.disable_ipv6=1' >/etc/sysctl.d/99-superproxy-ipv6.conf; sysctl -p /etc/sysctl.d/99-superproxy-ipv6.conf >/dev/null 2>&1||true
+/etc/init.d/superproxy enable; /etc/init.d/superproxy restart; sleep 1
+if ! /etc/init.d/superproxy status >/dev/null 2>&1;then echo 'ERROR: SuperProxy failed to start'; logread -e superproxyd | tail -20; exit 1;fi
+echo '========================================'; echo ' SuperProxy v0.3.0 installed'; echo " Architecture: $(uname -m)"; echo ' Dashboard: http://ROUTER_IP:9088'; [ -n "$NEW_TOKEN" ]&&echo " Management Token: $NEW_TOKEN"; command -v sing-box >/dev/null 2>&1&&echo " sing-box: $(sing-box version | head -1)"||echo ' sing-box: NOT installed'; echo '========================================'

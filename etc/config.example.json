@@ -1,5 +1,5 @@
 {
-  "listen": "0.0.0.0:9090",
+  "listen": "0.0.0.0:9088",
   "token": "CHANGE-ME-NOW",
   "lan_interface": "br-lan",
   "wan_interface": "wan",

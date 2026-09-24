@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Node struct {
@@ -60,6 +64,7 @@ func main() {
 	mux.HandleFunc("/api/logs", a.auth(a.logs))
 	mux.HandleFunc("/api/core", a.auth(a.core))
 	mux.HandleFunc("/api/core/install", a.auth(a.coreInstall))
+	mux.HandleFunc("/api/node/test/", a.auth(a.nodeTest))
 	mux.Handle("/", http.FileServer(http.Dir(env("SUPERPROXY_WEB", "/usr/share/superproxy/web"))))
 	log.Printf("SuperProxy listening on %s", a.cfg.Listen)
 	log.Fatal(http.ListenAndServe(a.cfg.Listen, mux))
@@ -70,12 +75,32 @@ func env(k, d string) string {
 	}
 	return d
 }
+func randomToken() string {
+	b := make([]byte, 24)
+	if _, e := rand.Read(b); e != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
 func (a *App) load() error {
 	b, e := os.ReadFile(a.path)
 	if e != nil {
 		return e
 	}
-	return json.Unmarshal(b, &a.cfg)
+	if e = json.Unmarshal(b, &a.cfg); e != nil {
+		return e
+	}
+	if a.cfg.Listen == "" || a.cfg.Listen == "0.0.0.0:9090" {
+		a.cfg.Listen = "0.0.0.0:9088"
+	}
+	if a.cfg.Token == "" || a.cfg.Token == "CHANGE-ME-NOW" {
+		a.cfg.Token = randomToken()
+		if a.cfg.Token == "" {
+			return fmt.Errorf("cannot generate token")
+		}
+		return a.save()
+	}
+	return nil
 }
 func (a *App) save() error {
 	b, _ := json.MarshalIndent(a.cfg, "", "  ")
@@ -97,17 +122,21 @@ func jsonOut(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
 }
+func commandOutput(name string, args ...string) string {
+	o, _ := exec.Command(name, args...).CombinedOutput()
+	return strings.TrimSpace(string(o))
+}
+func running() bool {
+	return exec.Command("pgrep", "-f", "sing-box run -c /etc/sing-box/config.json").Run() == nil
+}
 func (a *App) status(w http.ResponseWriter, r *http.Request) {
-	_, lookErr := exec.LookPath("sing-box")
-	service := "not installed"
-	version := ""
-	if lookErr == nil {
-		out, _ := exec.Command("/etc/init.d/sing-box", "status").CombinedOutput()
-		service = strings.TrimSpace(string(out))
-		v, _ := exec.Command("sing-box", "version").CombinedOutput()
-		version = strings.TrimSpace(string(v))
+	path, e := exec.LookPath("sing-box")
+	installed := e == nil
+	ver := ""
+	if installed {
+		ver = commandOutput(path, "version")
 	}
-	jsonOut(w, map[string]any{"core_installed": lookErr == nil, "core_version": version, "service": service, "nodes": len(a.cfg.Nodes), "bindings": len(a.cfg.Bindings)})
+	jsonOut(w, map[string]any{"core_installed": installed, "core_running": running(), "core_version": ver, "nodes": len(a.cfg.Nodes), "bindings": len(a.cfg.Bindings), "arch": commandOutput("uname", "-m"), "listen": a.cfg.Listen, "tun": a.cfg.TunName})
 }
 func (a *App) config(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
@@ -131,13 +160,16 @@ func (a *App) config(w http.ResponseWriter, r *http.Request) {
 	if c.Token == "" {
 		c.Token = a.cfg.Token
 	}
+	old := a.cfg
 	a.cfg = c
-	if err := a.validate(); err != nil {
-		http.Error(w, err.Error(), 400)
+	if e := a.validate(); e != nil {
+		a.cfg = old
+		http.Error(w, e.Error(), 400)
 		return
 	}
-	if err := a.save(); err != nil {
-		http.Error(w, err.Error(), 500)
+	if e := a.save(); e != nil {
+		a.cfg = old
+		http.Error(w, e.Error(), 500)
 		return
 	}
 	jsonOut(w, map[string]bool{"ok": true})
@@ -146,7 +178,7 @@ func (a *App) validate() error {
 	seen := map[string]string{}
 	nodes := map[string]bool{}
 	for _, n := range a.cfg.Nodes {
-		if n.ID == "" || n.Server == "" || n.Port < 1 {
+		if n.ID == "" || n.Server == "" || n.Port < 1 || n.Port > 65535 {
 			return fmt.Errorf("invalid node")
 		}
 		nodes[n.ID] = true
@@ -168,53 +200,30 @@ func (a *App) validate() error {
 	}
 	return nil
 }
-func (a *App) apply(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.validate(); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+func nodeOutbound(n Node) map[string]any {
+	m := map[string]any{"type": n.Type, "tag": "node-" + n.ID, "server": n.Server, "server_port": n.Port}
+	if n.UUID != "" {
+		m["uuid"] = n.UUID
 	}
-	if err := a.generate(); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+	if n.Username != "" {
+		m["username"] = n.Username
 	}
-	if out, err := exec.Command("sing-box", "check", "-c", "/etc/sing-box/config.json").CombinedOutput(); err != nil {
-		http.Error(w, "sing-box check failed: "+string(out), 500)
-		return
+	if n.Password != "" {
+		m["password"] = n.Password
 	}
-	if out, err := exec.Command("/usr/libexec/superproxy-firewall", "apply").CombinedOutput(); err != nil {
-		http.Error(w, "firewall failed: "+string(out), 500)
-		return
+	if n.Method != "" {
+		m["method"] = n.Method
 	}
-	out, err := exec.Command("/etc/init.d/sing-box", "restart").CombinedOutput()
-	if err != nil {
-		http.Error(w, string(out), 500)
-		return
+	if n.TLS {
+		m["tls"] = map[string]any{"enabled": true, "server_name": n.ServerName}
 	}
-	jsonOut(w, map[string]bool{"ok": true})
+	return m
 }
 func (a *App) generate() error {
 	os.MkdirAll("/etc/sing-box", 0755)
-	out := []map[string]any{{"type": "direct", "tag": "direct"}}
+	outs := []map[string]any{}
 	for _, n := range a.cfg.Nodes {
-		m := map[string]any{"type": n.Type, "tag": "node-" + n.ID, "server": n.Server, "server_port": n.Port}
-		if n.UUID != "" {
-			m["uuid"] = n.UUID
-		}
-		if n.Username != "" {
-			m["username"] = n.Username
-		}
-		if n.Password != "" {
-			m["password"] = n.Password
-		}
-		if n.Method != "" {
-			m["method"] = n.Method
-		}
-		if n.TLS {
-			m["tls"] = map[string]any{"enabled": true, "server_name": n.ServerName}
-		}
-		out = append(out, m)
+		outs = append(outs, nodeOutbound(n))
 	}
 	rules := []map[string]any{}
 	for _, b := range a.cfg.Bindings {
@@ -225,13 +234,40 @@ func (a *App) generate() error {
 		rules = append(rules, map[string]any{"source_ip_cidr": cidrs, "action": "route", "outbound": "node-" + b.NodeID})
 	}
 	rules = append(rules, map[string]any{"action": "reject", "method": "drop"})
-	cfg := map[string]any{"log": map[string]any{"level": "info", "timestamp": true}, "inbounds": []any{map[string]any{"type": "tun", "tag": "tun-in", "interface_name": a.cfg.TunName, "address": []string{"172.19.0.1/30"}, "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "system"}}, "outbounds": out, "route": map[string]any{"rules": rules}}
+	cfg := map[string]any{"log": map[string]any{"level": "info", "timestamp": true}, "inbounds": []any{map[string]any{"type": "tun", "tag": "tun-in", "interface_name": a.cfg.TunName, "address": []string{"172.19.0.1/30"}, "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "system"}}, "outbounds": outs, "route": map[string]any{"rules": rules}}
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	tmp := "/etc/sing-box/config.json.tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
-		return err
+	if e := os.WriteFile(tmp, b, 0600); e != nil {
+		return e
 	}
 	return os.Rename(tmp, "/etc/sing-box/config.json")
+}
+func (a *App) apply(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if e := a.validate(); e != nil {
+		http.Error(w, e.Error(), 400)
+		return
+	}
+	if e := a.generate(); e != nil {
+		http.Error(w, e.Error(), 500)
+		return
+	}
+	if out, e := exec.Command("sing-box", "check", "-c", "/etc/sing-box/config.json").CombinedOutput(); e != nil {
+		http.Error(w, "sing-box check failed: "+string(out), 500)
+		return
+	}
+	if out, e := exec.Command("/usr/libexec/superproxy-firewall", "apply").CombinedOutput(); e != nil {
+		http.Error(w, "firewall failed: "+string(out), 500)
+		return
+	}
+	out, e := exec.Command("/etc/init.d/superproxy-singbox", "restart").CombinedOutput()
+	time.Sleep(700 * time.Millisecond)
+	if e != nil || !running() {
+		http.Error(w, "sing-box start failed: "+string(out)+"\n"+commandOutput("logread", "-e", "superproxy-singbox"), 500)
+		return
+	}
+	jsonOut(w, map[string]any{"ok": true, "running": true})
 }
 func (a *App) service(w http.ResponseWriter, r *http.Request) {
 	act := filepath.Base(r.URL.Path)
@@ -239,28 +275,83 @@ func (a *App) service(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad action", 400)
 		return
 	}
-	out, err := exec.Command("/etc/init.d/sing-box", act).CombinedOutput()
-	jsonOut(w, map[string]any{"ok": err == nil, "output": string(out)})
+	out, e := exec.Command("/etc/init.d/superproxy-singbox", act).CombinedOutput()
+	time.Sleep(350 * time.Millisecond)
+	jsonOut(w, map[string]any{"ok": e == nil, "running": running(), "output": string(out)})
 }
 func (a *App) core(w http.ResponseWriter, r *http.Request) {
-	path, err := exec.LookPath("sing-box")
-	if err != nil {
+	path, e := exec.LookPath("sing-box")
+	if e != nil {
 		jsonOut(w, map[string]any{"installed": false})
 		return
 	}
-	out, _ := exec.Command(path, "version").CombinedOutput()
-	jsonOut(w, map[string]any{"installed": true, "path": path, "version": strings.TrimSpace(string(out))})
+	jsonOut(w, map[string]any{"installed": true, "path": path, "version": commandOutput(path, "version"), "running": running()})
 }
 func (a *App) coreInstall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method", 405)
 		return
 	}
-	out, err := exec.Command("/usr/libexec/superproxy-core", "install").CombinedOutput()
-	jsonOut(w, map[string]any{"ok": err == nil, "output": string(out)})
+	out, e := exec.Command("/usr/libexec/superproxy-core", "install").CombinedOutput()
+	jsonOut(w, map[string]any{"ok": e == nil, "output": string(out)})
 }
 func (a *App) logs(w http.ResponseWriter, r *http.Request) {
 	out, _ := exec.Command("logread", "-e", "sing-box").CombinedOutput()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(out)
+}
+func (a *App) nodeTest(w http.ResponseWriter, r *http.Request) {
+	id := filepath.Base(r.URL.Path)
+	var n *Node
+	for i := range a.cfg.Nodes {
+		if a.cfg.Nodes[i].ID == id {
+			n = &a.cfg.Nodes[i]
+			break
+		}
+	}
+	if n == nil {
+		http.Error(w, "node not found", 404)
+		return
+	}
+	start := time.Now()
+	conn, e := net.DialTimeout("tcp", net.JoinHostPort(n.Server, strconv.Itoa(n.Port)), 5*time.Second)
+	if e != nil {
+		jsonOut(w, map[string]any{"ok": false, "stage": "tcp", "error": e.Error()})
+		return
+	}
+	conn.Close()
+	tcpms := time.Since(start).Milliseconds()
+	ln, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		http.Error(w, e.Error(), 500)
+		return
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	testcfg := map[string]any{"log": map[string]any{"level": "error"}, "inbounds": []any{map[string]any{"type": "mixed", "tag": "test-in", "listen": "127.0.0.1", "listen_port": port}}, "outbounds": []any{nodeOutbound(*n)}, "route": map[string]any{"default_domain_resolver": "local"}, "dns": map[string]any{"servers": []any{map[string]any{"type": "local", "tag": "local"}}}}
+	b, _ := json.Marshal(testcfg)
+	tmp := fmt.Sprintf("/tmp/superproxy-node-test-%d.json", time.Now().UnixNano())
+	os.WriteFile(tmp, b, 0600)
+	defer os.Remove(tmp)
+	cmd := exec.Command("sing-box", "run", "-c", tmp)
+	if e = cmd.Start(); e != nil {
+		jsonOut(w, map[string]any{"ok": false, "stage": "start", "error": e.Error()})
+		return
+	}
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	}()
+	time.Sleep(400 * time.Millisecond)
+	proxy := fmt.Sprintf("socks5h://127.0.0.1:%d", port)
+	t := time.Now()
+	out, e := exec.Command("curl", "-4", "-fsS", "--max-time", "10", "--proxy", proxy, "https://api.ipify.org").CombinedOutput()
+	ms := time.Since(t).Milliseconds()
+	if e != nil {
+		jsonOut(w, map[string]any{"ok": false, "stage": "proxy", "tcp_ms": tcpms, "latency_ms": ms, "error": strings.TrimSpace(string(out))})
+		return
+	}
+	jsonOut(w, map[string]any{"ok": true, "tcp_ms": tcpms, "latency_ms": ms, "exit_ip": strings.TrimSpace(string(out))})
 }
