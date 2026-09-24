@@ -1,3 +1,5 @@
+# SuperProxy v0.4.1
+
 # SuperProxy v0.3.1
 
 OpenWrt/iStoreOS fixed-IP proxy controller for sing-box.
@@ -39,3 +41,10 @@ The installer preserves `/etc/superproxy/config.json`. If the token is still `CH
 - Node tests now run `sing-box check` on the exact temporary outbound before starting it.
 - Test failures return a stage (`tcp`, `config`, `start`, `proxy`) and include sing-box diagnostics.
 - Dashboard exposes REALITY fields for manual VLESS nodes and identifies REALITY/Vision nodes in the list.
+
+
+## v0.4.1
+- Fixed/normalized remote `wget | sh` panel installer.
+- Installer prints progress and download errors instead of failing silently.
+- Keeps existing `/etc/superproxy/config.json` and migrates dashboard port 9090 to 9088.
+- Retains v0.4 VLESS REALITY/Vision import and sing-box-backed node testing.
